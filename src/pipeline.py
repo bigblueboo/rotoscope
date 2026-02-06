@@ -80,34 +80,73 @@ class VideoToPolygonPipeline:
         # Resize to target dimensions
         resized = self._resize_image(image)
 
-        # Quantize colors
-        indexed, palette = kmeans_quantize(resized, self.num_colors)
+        # ---- Pre-smooth to create coherent colour regions ----
+        # Bilateral filter preserves edges while smoothing colour noise
+        if HAS_CV2:
+            smoothed = cv2.bilateralFilter(resized, d=9, sigmaColor=75, sigmaSpace=75)
+            # Second pass for stronger effect
+            smoothed = cv2.bilateralFilter(smoothed, d=9, sigmaColor=50, sigmaSpace=50)
+        else:
+            smoothed = resized
 
-        # Create polygons for each color region
+        # Quantize colors
+        indexed, palette = kmeans_quantize(smoothed, self.num_colors)
+
+        # ---- Morphological cleaning on each colour mask ----
+        # This merges nearby fragments and fills small holes
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)) if HAS_CV2 else None
+
+        # Find the most common colour to use as the background layer
+        color_areas = []
+        for ci in range(self.num_colors):
+            color_areas.append(((indexed == ci).sum(), ci))
+        color_areas.sort(reverse=True)
+        bg_color = color_areas[0][1]
+
+        # Build polygon list: background first, then smaller regions on top
         polygons = []
-        for color_idx in range(self.num_colors):
-            # Create binary mask for this color
+
+        # Full-frame background rectangle in the dominant colour
+        polygons.append(Polygon(
+            id=self._next_polygon_id(),
+            vertices=np.array([[0, 0], [self.width - 1, 0],
+                               [self.width - 1, self.height - 1],
+                               [0, self.height - 1]], dtype=np.int16),
+            color_index=bg_color,
+        ))
+
+        # Process colours from largest area to smallest (painter's algorithm)
+        for _, color_idx in color_areas:
+            # Skip the background colour - already covered by the rectangle
+            if color_idx == bg_color:
+                continue
+
             mask = (indexed == color_idx).astype(np.uint8) * 255
 
-            # Skip if no pixels of this color
+            # Morphological close: fill small gaps and merge nearby fragments
+            if kernel is not None:
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+                # Small open to remove remaining specks
+                small_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, small_kernel)
+
             if mask.sum() == 0:
                 continue
 
             # Convert mask to simplified polygons
             color_polygons = mask_to_polygons(
                 mask,
-                epsilon_ratio=max(self.epsilon_ratio, 0.04),  # Minimum aggressiveness
+                epsilon_ratio=max(self.epsilon_ratio, 0.04),
                 min_area=self.min_polygon_area,
-                max_vertices=20  # Keep polygons very simple for Another World style
+                max_vertices=20,
             )
 
-            # Create Polygon objects
             for vertices in color_polygons:
                 if len(vertices) >= 3:
                     polygons.append(Polygon(
                         id=self._next_polygon_id(),
                         vertices=vertices,
-                        color_index=color_idx
+                        color_index=color_idx,
                     ))
 
         frame = Frame(index=0, polygons=polygons, palette=palette)
@@ -246,8 +285,9 @@ class SAM2Pipeline:
     ) -> Frame:
         """
         Build one Frame by:
-          – colour-quantizing the background (areas not covered by SAM)
-          – overlaying SAM-segmented foreground polygons on top
+          – full-frame background in dominant colour
+          – colour-quantized background regions (smoothed + cleaned)
+          – SAM-segmented foreground polygons on top
         """
         h, w = self.height, self.width
 
@@ -256,6 +296,10 @@ class SAM2Pipeline:
             img = cv2.resize(image_rgb, (w, h), interpolation=cv2.INTER_AREA)
         else:
             img = image_rgb
+
+        # Pre-smooth for cleaner background regions
+        smoothed = cv2.bilateralFilter(img, d=9, sigmaColor=75, sigmaSpace=75)
+        smoothed = cv2.bilateralFilter(smoothed, d=9, sigmaColor=50, sigmaSpace=50)
 
         # Resize SAM masks to output dims
         resized_masks: Dict[int, np.ndarray] = {}
@@ -277,11 +321,34 @@ class SAM2Pipeline:
             return pid[0]
 
         # ---- background: colour-quantize uncovered areas ----
-        bg_indexed, bg_palette = kmeans_quantize(img, self.N_BG_COLORS)
+        bg_indexed, bg_palette = kmeans_quantize(smoothed, self.N_BG_COLORS)
         palette[:self.N_BG_COLORS] = bg_palette
 
+        # Find most common bg colour for the base rectangle
+        bg_areas = []
         for ci in range(self.N_BG_COLORS):
+            bg_areas.append(((bg_indexed == ci).sum(), ci))
+        bg_areas.sort(reverse=True)
+        base_color = bg_areas[0][1]
+
+        # Full-frame base rectangle (eliminates black gaps)
+        polygons.append(Polygon(
+            id=next_pid(),
+            vertices=np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]],
+                              dtype=np.int16),
+            color_index=base_color,
+        ))
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        small_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+        for _, ci in bg_areas:
+            if ci == base_color:
+                continue
             mask = ((bg_indexed == ci) & ~sam_union).astype(np.uint8) * 255
+            # Morphological cleanup
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, small_kernel)
             if mask.sum() == 0:
                 continue
             polys = mask_to_polygons(
