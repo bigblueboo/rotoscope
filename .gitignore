@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# SAM 2 repo (large, installed as package)
+sam2_repo/
+
+# Lester reference repo (third-party)
+lester/
+
+# Model checkpoints
+*.pt
+*.pth
+*.onnx
+
+# Large media files
+samples/inputs/*.mp4
+
+# macOS
+.DS_Store
+
+# Temp files
+*.tmp
+/tmp/
+
+# Editor
+.vscode/
+.idea/
+
+# Test artifacts that aren't useful to track
+test_decoded.png
+test_fresh_output.png
+test_original.png
+test_output.png
+test.roto
